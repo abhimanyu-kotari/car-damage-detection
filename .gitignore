@@ -1,0 +1,16 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local environment files
+.env
+
+# Ultralytics training outputs
+runs/
+
+# OS files
+.DS_Store
+Thumbs.db
