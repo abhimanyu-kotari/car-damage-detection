@@ -125,10 +125,13 @@ st.markdown("""
 # =========================================================
 
 @st.cache_resource
-def load_model():
-    return YOLO("best.pt")
-
-model = load_model()
+def load_model(model_path="best.pt"):
+    try:
+        return YOLO(model_path)
+    except Exception as e:
+        if os.path.exists("best_nano.pt"):
+            return YOLO("best_nano.pt")
+        raise e
 
 # =========================================================
 # SIDEBAR
@@ -142,9 +145,19 @@ with st.sidebar:
 
     st.divider()
 
+    model_options = ["YOLOv8 Medium (High Accuracy)", "YOLOv8 Nano (Fast / Fallback)"] if os.path.exists("best_nano.pt") else ["YOLOv8 Medium"]
+    selected_model_label = st.selectbox(
+        "Model Version",
+        options=model_options,
+        index=0,
+        help="Select between the high-accuracy Medium model and the lightweight Nano model."
+    )
+    selected_model_path = "best_nano.pt" if "Nano" in selected_model_label else "best.pt"
+    model = load_model(selected_model_path)
+
     st.markdown("### Model Information")
 
-    st.write("**Architecture:** YOLOv8 Segmentation")
+    st.write(f"**Architecture:** {selected_model_label.split(' (')[0]} Segmentation")
     st.write("**Model:** Custom Trained")
     st.write("**Damage Classes:** 6")
 
