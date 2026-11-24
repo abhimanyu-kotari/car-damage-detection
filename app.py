@@ -248,7 +248,7 @@ def generate_xai_heatmap(model, img_rgb):
 # INFERENCE LOGIC
 # =========================================================
 
-def run_detection(image_np, conf_thresh, model_key="ensemble"):
+def run_detection(image_np, conf_thresh, model_key="tri_ensemble", consensus_mode="strict"):
     """
     Runs inference using the user-selected model mode.
     Guarantees native imgsz (640 for v8m/nano, 800 for v11m) and native result.plot() rendering!
@@ -270,6 +270,20 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
         union = a1 + a2 - inter
         return inter / union if union > 0 else 0
 
+    # ---------------------------------------------------------
+    # Helper to check if two boxes represent the same damage event
+    # ---------------------------------------------------------
+    def boxes_match(b1, b2, c_name):
+        iou = box_iou(b1, b2)
+        threshold = 0.15 if c_name == "dent" else 0.25
+        if iou >= threshold:
+            return True
+        cx1, cy1 = (b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2
+        cx2, cy2 = (b2[0] + b2[2]) / 2, (b2[1] + b2[3]) / 2
+        if (b2[0] <= cx1 <= b2[2] and b2[1] <= cy1 <= b2[3]) or (b1[0] <= cx2 <= b1[2] and b1[1] <= cy2 <= b1[3]):
+            return True
+        return False
+
     # =========================================================
     # MODE 1: TRI-MODEL CONSENSUS ENSEMBLE (v8m + 11m + v8n)
     # =========================================================
@@ -279,48 +293,67 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
         res_v11 = loaded_models["yolo11m"].predict(source=image_np, conf=conf_thresh, imgsz=800, verbose=False)[0]
         res_v8n = loaded_models["nano"].predict(source=image_np, conf=conf_thresh, imgsz=640, verbose=False)[0]
 
-        # Use YOLOv8m's clean native segmentation plot as base (C-contiguous RGB)
-        annotated_bgr = res_v8m.plot()
-        annotated_image = np.ascontiguousarray(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB))
+        # Clean canvas to ensure only consensus-verified defects are rendered
+        annotated_image = np.ascontiguousarray(image_np.copy())
+        overlay = annotated_image.copy()
+        h_img, w_img = annotated_image.shape[:2]
+
+        CLASS_COLORS = {
+            "dent": (0, 200, 255),          # Cyan / Bright Sky Blue
+            "scratch": (245, 158, 11),      # Amber / Orange
+            "crack": (236, 72, 153),        # Pink / Magenta
+            "glass shatter": (168, 85, 247),# Purple
+            "lamp broken": (234, 179, 8),   # Yellow
+            "tire flat": (239, 68, 68)      # Red
+        }
 
         candidates = []
         if res_v8m.boxes is not None:
             names_v8m = loaded_models["yolov8m"].names
-            for box in res_v8m.boxes:
+            masks_v8m = res_v8m.masks.xy if res_v8m.masks is not None else []
+            for i, box in enumerate(res_v8m.boxes):
+                poly = masks_v8m[i] if i < len(masks_v8m) else None
                 candidates.append({
                     "model": "v8m",
                     "label": "YOLOv8 Medium",
                     "name": names_v8m[int(box.cls[0])].lower(),
                     "conf": float(box.conf[0]),
                     "box": box.xyxy[0].cpu().numpy(),
+                    "poly": poly,
                     "weight": 0.45
                 })
 
         if res_v11.boxes is not None:
             names_v11 = loaded_models["yolo11m"].names
-            for box in res_v11.boxes:
+            masks_v11 = res_v11.masks.xy if res_v11.masks is not None else []
+            for i, box in enumerate(res_v11.boxes):
+                poly = masks_v11[i] if i < len(masks_v11) else None
                 candidates.append({
                     "model": "11m",
                     "label": "YOLO11m Specialist",
                     "name": names_v11[int(box.cls[0])].lower(),
                     "conf": float(box.conf[0]),
                     "box": box.xyxy[0].cpu().numpy(),
+                    "poly": poly,
                     "weight": 0.40
                 })
 
         if res_v8n.boxes is not None:
             names_v8n = loaded_models["nano"].names
-            for box in res_v8n.boxes:
+            masks_v8n = res_v8n.masks.xy if res_v8n.masks is not None else []
+            for i, box in enumerate(res_v8n.boxes):
+                poly = masks_v8n[i] if i < len(masks_v8n) else None
                 candidates.append({
                     "model": "v8n",
                     "label": "YOLOv8 Nano",
                     "name": names_v8n[int(box.cls[0])].lower(),
                     "conf": float(box.conf[0]),
                     "box": box.xyxy[0].cpu().numpy(),
+                    "poly": poly,
                     "weight": 0.15
                 })
 
-        # Group candidates into spatial clusters by defect class and IoU
+        # Group candidates into spatial clusters by defect class and position
         clusters = []
         used = [False] * len(candidates)
         for i, c1 in enumerate(candidates):
@@ -330,15 +363,15 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
             used[i] = True
             for j in range(i + 1, len(candidates)):
                 if not used[j] and candidates[j]["name"] == c1["name"]:
-                    # Lower threshold for dent to merge contiguous panel deformities
-                    iou_limit = 0.20 if c1["name"] == "dent" else 0.30
-                    if box_iou(c1["box"], candidates[j]["box"]) > iou_limit:
+                    if boxes_match(c1["box"], candidates[j]["box"], c1["name"]):
                         cluster.append(candidates[j])
                         used[j] = True
             clusters.append(cluster)
 
+        specialist_classes = {"crack", "dent", "scratch"}
+
         # Evaluate consensus across clusters
-        h_img, w_img = annotated_image.shape[:2]
+        has_overlay_masks = False
         for cl in clusters:
             c_name = cl[0]["name"]
             models_present = {c["model"] for c in cl}
@@ -346,11 +379,41 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
             max_conf = best_cand["conf"]
             xyxy = best_cand["box"]
 
-            # Case A: Consensus Agreement (>= 2 models agree)
-            if len(models_present) >= 2:
-                model_labels = [c["label"] for c in cl]
-                source_str = f"Consensus ({', '.join(sorted(set(model_labels)))})"
-                xai_reason = f"Confirmed by {len(models_present)} independent models with {max_conf:.0%} peak confidence."
+            confirmed = False
+            source_str = ""
+            xai_reason = ""
+
+            # STRICT UNANIMOUS MODE
+            if consensus_mode == "strict":
+                if c_name in specialist_classes:
+                    # User requirement: All 3 models MUST agree on dent, scratch, or crack!
+                    if {"v8m", "11m", "v8n"}.issubset(models_present):
+                        confirmed = True
+                        source_str = "Triple Consensus (YOLOv8m + YOLO11m + YOLOv8n)"
+                        xai_reason = "100% Unanimous Agreement: Independently verified by YOLOv8m, YOLO11m, and YOLOv8n."
+                else:
+                    # Rare classes: Both models trained on them (v8m and v8n) must agree!
+                    if {"v8m", "v8n"}.issubset(models_present):
+                        confirmed = True
+                        source_str = "Dual Consensus (YOLOv8m + YOLOv8n)"
+                        xai_reason = "Verified independently by both YOLOv8m and YOLOv8n."
+                    elif "v8m" in models_present and max_conf >= 0.50:
+                        confirmed = True
+                        source_str = "YOLOv8 Medium (High Confidence)"
+                        xai_reason = f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
+            # MAJORITY VOTING MODE
+            else:
+                if len(models_present) >= 2:
+                    confirmed = True
+                    model_labels = [c["label"] for c in cl]
+                    source_str = f"Consensus ({', '.join(sorted(set(model_labels)))})"
+                    xai_reason = f"Confirmed by {len(models_present)} independent models with {max_conf:.0%} peak confidence."
+                elif "v8m" in models_present and max_conf >= max(conf_thresh, 0.40):
+                    confirmed = True
+                    source_str = "YOLOv8 Medium"
+                    xai_reason = f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
+
+            if confirmed:
                 detections.append({
                     "name": c_name,
                     "confidence": max_conf,
@@ -358,64 +421,31 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
                     "source": source_str,
                     "xai_reason": xai_reason
                 })
-                # If YOLOv8m wasn't part of this cluster, draw it
-                if "v8m" not in models_present:
-                    x1 = max(0, min(w_img - 1, int(xyxy[0])))
-                    y1 = max(0, min(h_img - 1, int(xyxy[1])))
-                    x2 = max(0, min(w_img - 1, int(xyxy[2])))
-                    y2 = max(0, min(h_img - 1, int(xyxy[3])))
-                    cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (16, 185, 129), 2)
-                    tag = f"{c_name.title()} {max_conf:.0%} (Consensus)"
-                    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    badge_y1 = max(0, y1 - th - 6)
-                    cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), (16, 185, 129), -1)
-                    cv2.putText(annotated_image, tag, (x1 + 3, max(th, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # Case B: Single Model Solo Detection
-            else:
-                solo_model = cl[0]["model"]
-                # 1. YOLOv8m solo: Authoritative on rare classes or solid detections
-                if solo_model == "v8m":
-                    min_thresh = conf_thresh if c_name in ["glass shatter", "lamp broken", "tire flat"] else max(conf_thresh, 0.35)
-                    if max_conf >= min_thresh:
-                        detections.append({
-                            "name": c_name,
-                            "confidence": max_conf,
-                            "box": xyxy,
-                            "source": "YOLOv8 Medium",
-                            "xai_reason": f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
-                        })
-                # 2. YOLO11m solo: Filter panel shadows & false positives
-                elif solo_model == "11m":
-                    min_thresh = max(conf_thresh, 0.40)
-                    if max_conf >= min_thresh:
-                        detections.append({
-                            "name": c_name,
-                            "confidence": max_conf,
-                            "box": xyxy,
-                            "source": "YOLO11m Specialist",
-                            "xai_reason": f"Fine surface feature captured by YOLO11m Attention."
-                        })
-                        x1 = max(0, min(w_img - 1, int(xyxy[0])))
-                        y1 = max(0, min(h_img - 1, int(xyxy[1])))
-                        x2 = max(0, min(w_img - 1, int(xyxy[2])))
-                        y2 = max(0, min(h_img - 1, int(xyxy[3])))
-                        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (236, 72, 153), 2)
-                        tag = f"{c_name.title()} {max_conf:.0%} (YOLO11)"
-                        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        badge_y1 = max(0, y1 - th - 6)
-                        cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), (236, 72, 153), -1)
-                        cv2.putText(annotated_image, tag, (x1 + 3, max(th, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                # 3. YOLOv8n solo: Prone to false positives (35% on background), require >= 55%
-                elif solo_model == "v8n":
-                    if max_conf >= 0.55:
-                        detections.append({
-                            "name": c_name,
-                            "confidence": max_conf,
-                            "box": xyxy,
-                            "source": "YOLOv8 Nano",
-                            "xai_reason": f"High-confidence candidate captured by YOLOv8 Nano."
-                        })
+                color = CLASS_COLORS.get(c_name, (0, 200, 255))
+                # Draw segmentation mask polygon if present
+                for cand in cl:
+                    if cand.get("poly") is not None and len(cand["poly"]) > 2:
+                        pts = np.array(cand["poly"], dtype=np.int32)
+                        cv2.fillPoly(overlay, [pts], color)
+                        cv2.polylines(annotated_image, [pts], True, color, 2)
+                        has_overlay_masks = True
+                        break
+
+                # Draw bounding box and stylish label badge
+                x1 = max(0, min(w_img - 1, int(xyxy[0])))
+                y1 = max(0, min(h_img - 1, int(xyxy[1])))
+                x2 = max(0, min(w_img - 1, int(xyxy[2])))
+                y2 = max(0, min(h_img - 1, int(xyxy[3])))
+                cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
+                badge_label = f"{c_name.title()} {max_conf:.0%} (3-Model Consensus)" if "Triple" in source_str else f"{c_name.title()} {max_conf:.0%}"
+                (tw, th), _ = cv2.getTextSize(badge_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                badge_y1 = max(0, y1 - th - 6)
+                cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), color, -1)
+                cv2.putText(annotated_image, badge_label, (x1 + 3, max(th, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        if has_overlay_masks:
+            annotated_image = cv2.addWeighted(annotated_image, 0.70, overlay, 0.30, 0)
 
     # =========================================================
     # MODE 2: DUAL-MODEL ENSEMBLE (v8m + 11m)
@@ -551,12 +581,20 @@ with st.sidebar:
     selected_mode = model_choices[selected_label]
 
     st.markdown("### Model Information")
+    consensus_mode = "strict"
     if selected_mode == "tri_ensemble":
         st.write("**Architecture:** Tri-Model Consensus Ensemble")
         st.write("• Generalist: YOLOv8m (27.2M params, 640px)")
         st.write("• Specialist: YOLO11m (22.4M params, 800px)")
         st.write("• Verifier: YOLOv8n (3.4M params, 640px)")
-        st.caption("✨ Majority consensus voting across all 3 models eliminates isolated false positives.")
+        consensus_level = st.radio(
+            "Consensus Verification Rule",
+            options=["Strict Unanimous (All 3 Models must agree) 🔒", "Majority Voting (At least 2 Models agree) ⚖️"],
+            index=0,
+            help="Strict Unanimous requires YOLOv8m, YOLO11m, and YOLOv8n to all independently detect a Dent, Scratch, or Crack to confirm it."
+        )
+        consensus_mode = "strict" if "Strict" in consensus_level else "majority"
+        st.caption("✨ Strict Unanimous eliminates single-model false positives.")
     elif selected_mode == "ensemble":
         st.write("**Architecture:** Dual-Model Ensemble")
         st.write("• Base: YOLOv8m (All 6 Classes, 640px)")
@@ -624,7 +662,7 @@ else:
     if detect_button:
         try:
             with st.spinner("AI is analyzing the vehicle..."):
-                detections, annotated_img = run_detection(image_np, confidence, model_key=selected_mode)
+                detections, annotated_img = run_detection(image_np, confidence, model_key=selected_mode, consensus_mode=consensus_mode)
 
                 xai_heatmap_img = None
                 if enable_xai:
