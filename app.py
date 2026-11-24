@@ -248,7 +248,7 @@ def generate_xai_heatmap(model, img_rgb):
 # INFERENCE LOGIC
 # =========================================================
 
-def run_detection(image_np, conf_thresh, model_key="tri_ensemble", consensus_mode="strict"):
+def run_detection(image_np, conf_thresh, model_key="tri_ensemble"):
     """
     Runs inference using the user-selected model mode.
     Guarantees native imgsz (640 for v8m/nano, 800 for v11m) and native result.plot() rendering!
@@ -383,35 +383,17 @@ def run_detection(image_np, conf_thresh, model_key="tri_ensemble", consensus_mod
             source_str = ""
             xai_reason = ""
 
-            # STRICT UNANIMOUS MODE
-            if consensus_mode == "strict":
-                if c_name in specialist_classes:
-                    # User requirement: All 3 models MUST agree on dent, scratch, or crack!
-                    if {"v8m", "11m", "v8n"}.issubset(models_present):
-                        confirmed = True
-                        source_str = "Triple Consensus (YOLOv8m + YOLO11m + YOLOv8n)"
-                        xai_reason = "100% Unanimous Agreement: Independently verified by YOLOv8m, YOLO11m, and YOLOv8n."
-                else:
-                    # Rare classes: Both models trained on them (v8m and v8n) must agree!
-                    if {"v8m", "v8n"}.issubset(models_present):
-                        confirmed = True
-                        source_str = "Dual Consensus (YOLOv8m + YOLOv8n)"
-                        xai_reason = "Verified independently by both YOLOv8m and YOLOv8n."
-                    elif "v8m" in models_present and max_conf >= 0.50:
-                        confirmed = True
-                        source_str = "YOLOv8 Medium (High Confidence)"
-                        xai_reason = f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
-            # MAJORITY VOTING MODE
-            else:
-                if len(models_present) >= 2:
-                    confirmed = True
-                    model_labels = [c["label"] for c in cl]
-                    source_str = f"Consensus ({', '.join(sorted(set(model_labels)))})"
-                    xai_reason = f"Confirmed by {len(models_present)} independent models with {max_conf:.0%} peak confidence."
-                elif "v8m" in models_present and max_conf >= max(conf_thresh, 0.40):
-                    confirmed = True
-                    source_str = "YOLOv8 Medium"
-                    xai_reason = f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
+            # MAJORITY VOTING RULE (At least 2 models must independently agree)
+            if len(models_present) >= 2:
+                confirmed = True
+                model_labels = [c["label"] for c in cl]
+                source_str = f"Consensus ({' + '.join(sorted(set(model_labels)))})"
+                xai_reason = f"Confirmed by {len(models_present)} independent models with {max_conf:.0%} peak confidence."
+            # For rare generalist classes (glass shatter, lamp broken, tire flat) where YOLO11m was not trained:
+            elif c_name in ["glass shatter", "lamp broken", "tire flat"] and "v8m" in models_present and max_conf >= 0.45:
+                confirmed = True
+                source_str = "YOLOv8 Medium"
+                xai_reason = f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
 
             if confirmed:
                 detections.append({
@@ -438,7 +420,7 @@ def run_detection(image_np, conf_thresh, model_key="tri_ensemble", consensus_mod
                 x2 = max(0, min(w_img - 1, int(xyxy[2])))
                 y2 = max(0, min(h_img - 1, int(xyxy[3])))
                 cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
-                badge_label = f"{c_name.title()} {max_conf:.0%} (3-Model Consensus)" if "Triple" in source_str else f"{c_name.title()} {max_conf:.0%}"
+                badge_label = f"{c_name.title()} {max_conf:.0%} (Consensus)" if len(models_present) >= 2 else f"{c_name.title()} {max_conf:.0%}"
                 (tw, th), _ = cv2.getTextSize(badge_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 badge_y1 = max(0, y1 - th - 6)
                 cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), color, -1)
@@ -581,20 +563,13 @@ with st.sidebar:
     selected_mode = model_choices[selected_label]
 
     st.markdown("### Model Information")
-    consensus_mode = "strict"
     if selected_mode == "tri_ensemble":
         st.write("**Architecture:** Tri-Model Consensus Ensemble")
         st.write("• Generalist: YOLOv8m (27.2M params, 640px)")
         st.write("• Specialist: YOLO11m (22.4M params, 800px)")
-        st.write("• Verifier: YOLOv8n (3.4M params, 640px)")
-        consensus_level = st.radio(
-            "Consensus Verification Rule",
-            options=["Strict Unanimous (All 3 Models must agree) 🔒", "Majority Voting (At least 2 Models agree) ⚖️"],
-            index=0,
-            help="Strict Unanimous requires YOLOv8m, YOLO11m, and YOLOv8n to all independently detect a Dent, Scratch, or Crack to confirm it."
-        )
-        consensus_mode = "strict" if "Strict" in consensus_level else "majority"
-        st.caption("✨ Strict Unanimous eliminates single-model false positives.")
+        st.write("• Cross-Verifier: YOLOv8n (3.4M params, 640px)")
+        st.write("• **Consensus Rule:** Majority Voting (≥ 2 Models Agree)")
+        st.caption("✨ Eliminates isolated false positives: Any defect must be confirmed by at least 2 models.")
     elif selected_mode == "ensemble":
         st.write("**Architecture:** Dual-Model Ensemble")
         st.write("• Base: YOLOv8m (All 6 Classes, 640px)")
@@ -662,7 +637,7 @@ else:
     if detect_button:
         try:
             with st.spinner("AI is analyzing the vehicle..."):
-                detections, annotated_img = run_detection(image_np, confidence, model_key=selected_mode, consensus_mode=consensus_mode)
+                detections, annotated_img = run_detection(image_np, confidence, model_key=selected_mode)
 
                 xai_heatmap_img = None
                 if enable_xai:
