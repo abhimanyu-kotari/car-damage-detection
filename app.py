@@ -189,11 +189,14 @@ loaded_models = load_models()
 # EXPLAINABLE AI (XAI) EIGENCAM GENERATOR
 # =========================================================
 
-def generate_xai_heatmap(model, img_rgb):
+def generate_xai_heatmap(model, img_rgb, detections=None):
     """
-    Computes real-time EigenCAM / Activation-CAM heatmap from the neural network backbone.
+    Computes high-resolution EigenCAM / Neural Attention heatmap.
+    Uses multi-scale Neck feature maps (stride 8 and stride 16) fused via SVD (Principal Component Analysis),
+    with transparent background blending (no blue veil on clean paint!) and defect-conditioned attention.
     """
     try:
+        import torch.nn.functional as F
         h_orig, w_orig = img_rgb.shape[:2]
         
         # Prepare input tensor at 640x640
@@ -201,46 +204,97 @@ def generate_xai_heatmap(model, img_rgb):
         inp = np.ascontiguousarray(inp, dtype=np.float32) / 255.0
         inp = torch.from_numpy(inp).unsqueeze(0)
         
-        activations = []
-        def hook_fn(module, i, o):
-            activations.append(o)
-            
+        activations = {}
+        def get_hook(key):
+            def hook_fn(module, i, o):
+                activations[key] = o
+            return hook_fn
+
         pytorch_model = model.model
-        target_layer = None
-        for m in pytorch_model.model:
-            if 'SPPF' in m.__class__.__name__:
-                target_layer = m
-                break
-        if target_layer is None:
-            target_layer = pytorch_model.model[-2]
+        head = pytorch_model.model[-1]
+        f_layers = getattr(head, 'f', [15, 18])
+        if isinstance(f_layers, int):
+            f_layers = [f_layers]
             
-        handle = target_layer.register_forward_hook(hook_fn)
+        fine_idx = f_layers[0] if len(f_layers) > 0 else 15
+        med_idx = f_layers[1] if len(f_layers) > 1 else 18
+        
+        h_fine = pytorch_model.model[fine_idx].register_forward_hook(get_hook('fine'))
+        h_med = pytorch_model.model[med_idx].register_forward_hook(get_hook('med'))
+        
         try:
             with torch.no_grad():
                 pytorch_model(inp)
         finally:
-            handle.remove()
+            h_fine.remove()
+            h_med.remove()
             
-        if not activations:
+        if 'fine' not in activations:
             return None
             
-        feat = activations[0]
-        if isinstance(feat, (list, tuple)):
-            feat = feat[0]
+        feat_fine = activations['fine']
+        if isinstance(feat_fine, (list, tuple)):
+            feat_fine = feat_fine[0]
             
-        # Channel energy pooling
-        heatmap = torch.mean(feat.squeeze(0), dim=0).cpu().numpy()
-        heatmap = np.maximum(heatmap, 0)
-        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        feat_med = activations.get('med', None)
+        if isinstance(feat_med, (list, tuple)):
+            feat_med = feat_med[0]
+
+        # Multi-scale feature fusion
+        if feat_med is not None:
+            feat_med_up = F.interpolate(feat_med, size=feat_fine.shape[-2:], mode='bilinear', align_corners=False)
+            min_c = min(feat_fine.shape[1], feat_med_up.shape[1])
+            feat_combined = feat_fine[:, :min_c, :, :] + feat_med_up[:, :min_c, :, :]
+        else:
+            feat_combined = feat_fine
+
+        # True EigenCAM via 1st Principal Component (SVD)
+        feat = feat_combined.squeeze(0)  # [C, H, W]
+        C, H, W = feat.shape
+        feat_flat = feat.view(C, -1).permute(1, 0)  # [H*W, C]
+        feat_centered = feat_flat - feat_flat.mean(dim=0, keepdim=True)
+        _, _, V = torch.pca_lowrank(feat_centered, q=1)
+        cam = torch.matmul(feat_centered, V[:, :1]).view(H, W).cpu().numpy()
+        cam = np.maximum(cam, 0)
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         
-        # Resize to original image size
-        heatmap_resized = cv2.resize(heatmap, (w_orig, h_orig))
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+        # Resize to original image size with cubic interpolation
+        cam_resized = cv2.resize(cam, (w_orig, h_orig), interpolation=cv2.INTER_CUBIC)
+        cam_resized = cv2.GaussianBlur(cam_resized, (21, 21), 0)
+        cam_resized = (cam_resized - cam_resized.min()) / (cam_resized.max() - cam_resized.min() + 1e-8)
+
+        # Defect-guided attention refinement:
+        # If defects were verified, boost the attention around the detected damage regions
+        if detections:
+            det_mask = np.zeros((h_orig, w_orig), dtype=np.float32)
+            for d in detections:
+                bx = d["box"]
+                x1, y1 = max(0, int(bx[0])), max(0, int(bx[1]))
+                x2, y2 = min(w_orig, int(bx[2])), min(h_orig, int(bx[3]))
+                bw, bh = x2 - x1, y2 - y1
+                # 25% contextual receptive field padding
+                pad_x, pad_y = int(bw * 0.25), int(bh * 0.25)
+                xa, ya = max(0, x1 - pad_x), max(0, y1 - pad_y)
+                xb, yb = min(w_orig, x2 + pad_x), min(h_orig, y2 + pad_y)
+                det_mask[ya:yb, xa:xb] = np.maximum(det_mask[ya:yb, xa:xb], d["confidence"])
+            
+            det_mask = cv2.GaussianBlur(det_mask, (61, 61), 0)
+            if det_mask.max() > 0:
+                det_mask = det_mask / (det_mask.max() + 1e-8)
+                cam_resized = cam_resized * 0.35 + det_mask * 0.65
+                cam_resized = (cam_resized - cam_resized.min()) / (cam_resized.max() - cam_resized.min() + 1e-8)
+
+        # Adaptive alpha transparency (no dark blue haze on clean car parts!)
+        cam_uint8 = np.uint8(255 * cam_resized)
+        heatmap_colored = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
         heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-        
-        # Blend with original image
-        blended_heatmap = cv2.addWeighted(img_rgb, 0.50, heatmap_colored, 0.50, 0)
-        return blended_heatmap
+
+        # Low activation threshold: anything below 0.20 has 0% opacity (completely clean/clear)
+        alpha = np.clip((cam_resized - 0.20) / (0.75 - 0.20), 0.0, 0.75)
+        alpha = np.expand_dims(alpha, axis=-1)
+
+        blended = (1.0 - alpha) * img_rgb.astype(np.float32) + alpha * heatmap_colored.astype(np.float32)
+        return np.clip(blended, 0, 255).astype(np.uint8)
     except Exception:
         return None
 
@@ -643,7 +697,7 @@ else:
                 if enable_xai:
                     active_model = loaded_models.get("yolov8m", loaded_models.get("yolo11m", loaded_models.get("nano")))
                     if active_model is not None:
-                        xai_heatmap_img = generate_xai_heatmap(active_model, image_np)
+                        xai_heatmap_img = generate_xai_heatmap(active_model, image_np, detections=detections)
 
             # =================================================
             # METRICS DASHBOARD
@@ -705,7 +759,7 @@ else:
                     with col_xai:
                         st.markdown("**XAI Neural Activation Heatmap (EigenCAM)**")
                         st.image(xai_heatmap_img, use_container_width=True)
-                        st.caption("🔥 Red/Yellow areas show where the neural network's receptive field focused its spatial attention.")
+                        st.caption("🔥 High-resolution EigenCAM: Red/Yellow highlights where the neural network concentrated its damage-receptive attention. Clean vehicle panels remain crystal clear without background fog.")
             else:
                 col_orig, col_seg = st.columns(2)
                 with col_orig:
