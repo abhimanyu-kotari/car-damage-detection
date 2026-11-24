@@ -320,8 +320,10 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
                             d["source"] = "YOLO11m Specialist (Higher Confidence)"
                         break
 
-                # If YOLO11m caught a defect that YOLOv8m missed, add it and draw onto the image!
-                if not overlap:
+                # If YOLO11m caught a defect that YOLOv8m missed, only add it if it meets a reliable confidence threshold
+                # (Cracks on panel gaps and door shadows often produce weak 25-35% false positives)
+                min_threshold = max(conf_thresh, 0.40 if c_name == "crack" else 0.35)
+                if not overlap and conf >= min_threshold:
                     detections.append({
                         "name": c_name,
                         "confidence": conf,
@@ -428,9 +430,9 @@ with st.sidebar:
         "Detection Confidence",
         min_value=0.10,
         max_value=0.90,
-        value=0.25,
+        value=0.35,
         step=0.05,
-        help="Adjust detection threshold. Lower threshold detects more defects."
+        help="Adjust detection threshold (Recommended: 0.35 - 0.40). Lower values detect subtle micro-defects but may catch shadow lines; higher values eliminate false positives."
     )
 
     enable_xai = st.toggle(
