@@ -279,9 +279,9 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
         # 2. Run YOLO11m (Specialist) at its native 800px
         res_v11 = loaded_models["yolo11m"].predict(source=image_np, conf=conf_thresh, imgsz=800, verbose=False)[0]
 
-        # Use YOLOv8m's native plot as high-fidelity visual base
+        # Use YOLOv8m's native plot as high-fidelity visual base (C-contiguous RGB)
         annotated_bgr = res_v8.plot()
-        annotated_image = annotated_bgr[:, :, ::-1]
+        annotated_image = np.ascontiguousarray(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB))
 
         # Extract YOLOv8m detections
         if res_v8.boxes is not None:
@@ -330,12 +330,17 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
                         "xai_reason": f"Fine surface feature captured by YOLO11m Attention."
                     })
                     # Draw the new detection onto annotated_image
-                    x1, y1, x2, y2 = [int(v) for v in xyxy]
+                    h_img, w_img = annotated_image.shape[:2]
+                    x1 = max(0, min(w_img - 1, int(xyxy[0])))
+                    y1 = max(0, min(h_img - 1, int(xyxy[1])))
+                    x2 = max(0, min(w_img - 1, int(xyxy[2])))
+                    y2 = max(0, min(h_img - 1, int(xyxy[3])))
                     cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (236, 72, 153), 2)
                     tag = f"{c_name.title()} {conf:.0%} (YOLO11)"
                     (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(annotated_image, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), (236, 72, 153), -1)
-                    cv2.putText(annotated_image, tag, (x1 + 3, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    badge_y1 = max(0, y1 - th - 6)
+                    cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), (236, 72, 153), -1)
+                    cv2.putText(annotated_image, tag, (x1 + 3, max(th, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     # =========================================================
     # MODE 2: SINGLE MODEL (YOLOv8m, YOLOv8n, or YOLO11m)
@@ -347,9 +352,9 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
 
         res = target_model.predict(source=image_np, conf=conf_thresh, imgsz=img_size, verbose=False)[0]
         
-        # Native Ultralytics plot rendering
+        # Native Ultralytics plot rendering (C-contiguous RGB)
         annotated_bgr = res.plot()
-        annotated_image = annotated_bgr[:, :, ::-1]
+        annotated_image = np.ascontiguousarray(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB))
 
         if res.boxes is not None:
             names = target_model.names
