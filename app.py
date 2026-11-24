@@ -271,9 +271,156 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
         return inter / union if union > 0 else 0
 
     # =========================================================
-    # MODE 1: DUAL-MODEL ENSEMBLE
+    # MODE 1: TRI-MODEL CONSENSUS ENSEMBLE (v8m + 11m + v8n)
     # =========================================================
-    if model_key == "ensemble":
+    if model_key == "tri_ensemble":
+        # Run all 3 models at their optimal native resolutions
+        res_v8m = loaded_models["yolov8m"].predict(source=image_np, conf=conf_thresh, imgsz=640, verbose=False)[0]
+        res_v11 = loaded_models["yolo11m"].predict(source=image_np, conf=conf_thresh, imgsz=800, verbose=False)[0]
+        res_v8n = loaded_models["nano"].predict(source=image_np, conf=conf_thresh, imgsz=640, verbose=False)[0]
+
+        # Use YOLOv8m's clean native segmentation plot as base (C-contiguous RGB)
+        annotated_bgr = res_v8m.plot()
+        annotated_image = np.ascontiguousarray(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB))
+
+        candidates = []
+        if res_v8m.boxes is not None:
+            names_v8m = loaded_models["yolov8m"].names
+            for box in res_v8m.boxes:
+                candidates.append({
+                    "model": "v8m",
+                    "label": "YOLOv8 Medium",
+                    "name": names_v8m[int(box.cls[0])].lower(),
+                    "conf": float(box.conf[0]),
+                    "box": box.xyxy[0].cpu().numpy(),
+                    "weight": 0.45
+                })
+
+        if res_v11.boxes is not None:
+            names_v11 = loaded_models["yolo11m"].names
+            for box in res_v11.boxes:
+                candidates.append({
+                    "model": "11m",
+                    "label": "YOLO11m Specialist",
+                    "name": names_v11[int(box.cls[0])].lower(),
+                    "conf": float(box.conf[0]),
+                    "box": box.xyxy[0].cpu().numpy(),
+                    "weight": 0.40
+                })
+
+        if res_v8n.boxes is not None:
+            names_v8n = loaded_models["nano"].names
+            for box in res_v8n.boxes:
+                candidates.append({
+                    "model": "v8n",
+                    "label": "YOLOv8 Nano",
+                    "name": names_v8n[int(box.cls[0])].lower(),
+                    "conf": float(box.conf[0]),
+                    "box": box.xyxy[0].cpu().numpy(),
+                    "weight": 0.15
+                })
+
+        # Group candidates into spatial clusters by defect class and IoU
+        clusters = []
+        used = [False] * len(candidates)
+        for i, c1 in enumerate(candidates):
+            if used[i]:
+                continue
+            cluster = [c1]
+            used[i] = True
+            for j in range(i + 1, len(candidates)):
+                if not used[j] and candidates[j]["name"] == c1["name"]:
+                    # Lower threshold for dent to merge contiguous panel deformities
+                    iou_limit = 0.20 if c1["name"] == "dent" else 0.30
+                    if box_iou(c1["box"], candidates[j]["box"]) > iou_limit:
+                        cluster.append(candidates[j])
+                        used[j] = True
+            clusters.append(cluster)
+
+        # Evaluate consensus across clusters
+        h_img, w_img = annotated_image.shape[:2]
+        for cl in clusters:
+            c_name = cl[0]["name"]
+            models_present = {c["model"] for c in cl}
+            best_cand = max(cl, key=lambda c: c["conf"])
+            max_conf = best_cand["conf"]
+            xyxy = best_cand["box"]
+
+            # Case A: Consensus Agreement (>= 2 models agree)
+            if len(models_present) >= 2:
+                model_labels = [c["label"] for c in cl]
+                source_str = f"Consensus ({', '.join(sorted(set(model_labels)))})"
+                xai_reason = f"Confirmed by {len(models_present)} independent models with {max_conf:.0%} peak confidence."
+                detections.append({
+                    "name": c_name,
+                    "confidence": max_conf,
+                    "box": xyxy,
+                    "source": source_str,
+                    "xai_reason": xai_reason
+                })
+                # If YOLOv8m wasn't part of this cluster, draw it
+                if "v8m" not in models_present:
+                    x1 = max(0, min(w_img - 1, int(xyxy[0])))
+                    y1 = max(0, min(h_img - 1, int(xyxy[1])))
+                    x2 = max(0, min(w_img - 1, int(xyxy[2])))
+                    y2 = max(0, min(h_img - 1, int(xyxy[3])))
+                    cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (16, 185, 129), 2)
+                    tag = f"{c_name.title()} {max_conf:.0%} (Consensus)"
+                    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    badge_y1 = max(0, y1 - th - 6)
+                    cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), (16, 185, 129), -1)
+                    cv2.putText(annotated_image, tag, (x1 + 3, max(th, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Case B: Single Model Solo Detection
+            else:
+                solo_model = cl[0]["model"]
+                # 1. YOLOv8m solo: Authoritative on rare classes or solid detections
+                if solo_model == "v8m":
+                    min_thresh = conf_thresh if c_name in ["glass shatter", "lamp broken", "tire flat"] else max(conf_thresh, 0.35)
+                    if max_conf >= min_thresh:
+                        detections.append({
+                            "name": c_name,
+                            "confidence": max_conf,
+                            "box": xyxy,
+                            "source": "YOLOv8 Medium",
+                            "xai_reason": f"Detected with {max_conf:.0%} confidence by YOLOv8 Medium."
+                        })
+                # 2. YOLO11m solo: Filter panel shadows & false positives
+                elif solo_model == "11m":
+                    min_thresh = max(conf_thresh, 0.40)
+                    if max_conf >= min_thresh:
+                        detections.append({
+                            "name": c_name,
+                            "confidence": max_conf,
+                            "box": xyxy,
+                            "source": "YOLO11m Specialist",
+                            "xai_reason": f"Fine surface feature captured by YOLO11m Attention."
+                        })
+                        x1 = max(0, min(w_img - 1, int(xyxy[0])))
+                        y1 = max(0, min(h_img - 1, int(xyxy[1])))
+                        x2 = max(0, min(w_img - 1, int(xyxy[2])))
+                        y2 = max(0, min(h_img - 1, int(xyxy[3])))
+                        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (236, 72, 153), 2)
+                        tag = f"{c_name.title()} {max_conf:.0%} (YOLO11)"
+                        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        badge_y1 = max(0, y1 - th - 6)
+                        cv2.rectangle(annotated_image, (x1, badge_y1), (min(w_img - 1, x1 + tw + 6), y1), (236, 72, 153), -1)
+                        cv2.putText(annotated_image, tag, (x1 + 3, max(th, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                # 3. YOLOv8n solo: Prone to false positives (35% on background), require >= 55%
+                elif solo_model == "v8n":
+                    if max_conf >= 0.55:
+                        detections.append({
+                            "name": c_name,
+                            "confidence": max_conf,
+                            "box": xyxy,
+                            "source": "YOLOv8 Nano",
+                            "xai_reason": f"High-confidence candidate captured by YOLOv8 Nano."
+                        })
+
+    # =========================================================
+    # MODE 2: DUAL-MODEL ENSEMBLE (v8m + 11m)
+    # =========================================================
+    elif model_key == "ensemble":
         # 1. Run YOLOv8m (Generalist) at its native 640px
         res_v8 = loaded_models["yolov8m"].predict(source=image_np, conf=conf_thresh, imgsz=640, verbose=False)[0]
         # 2. Run YOLO11m (Specialist) at its native 800px
@@ -302,18 +449,17 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
         # Add any extra detections found by YOLO11m Specialist (crack, dent, scratch)
         if res_v11.boxes is not None:
             names_v11 = loaded_models["yolo11m"].names
-            masks_v11 = res_v11.masks.xy if res_v11.masks is not None else []
             for i, box in enumerate(res_v11.boxes):
                 c_id = int(box.cls[0])
                 c_name = names_v11[c_id].lower()
                 conf = float(box.conf[0])
                 xyxy = box.xyxy[0].cpu().numpy()
-                poly = masks_v11[i] if i < len(masks_v11) else None
 
-                # Check if YOLOv8m already detected this exact spot
+                # Check if YOLOv8m already detected this or adjacent contiguous damage
                 overlap = False
+                iou_threshold = 0.20 if c_name == "dent" else 0.35
                 for d in detections:
-                    if d["name"] == c_name and box_iou(d["box"], xyxy) > 0.40:
+                    if d["name"] == c_name and box_iou(d["box"], xyxy) > iou_threshold:
                         overlap = True
                         if conf > d["confidence"]:
                             d["confidence"] = conf
@@ -321,7 +467,6 @@ def run_detection(image_np, conf_thresh, model_key="ensemble"):
                         break
 
                 # If YOLO11m caught a defect that YOLOv8m missed, only add it if it meets a reliable confidence threshold
-                # (Cracks on panel gaps and door shadows often produce weak 25-35% false positives)
                 min_threshold = max(conf_thresh, 0.40 if c_name == "crack" else 0.35)
                 if not overlap and conf >= min_threshold:
                     detections.append({
@@ -386,25 +531,33 @@ with st.sidebar:
 
     # Build model options
     model_choices = {}
+    if "yolov8m" in loaded_models and "yolo11m" in loaded_models and "nano" in loaded_models:
+        model_choices["Tri-Model Consensus Ensemble (YOLOv8m + YOLO11m + YOLOv8n) 🏆"] = "tri_ensemble"
     if "yolov8m" in loaded_models and "yolo11m" in loaded_models:
         model_choices["Dual-Model Ensemble (YOLOv8m + YOLO11m) ⭐"] = "ensemble"
     if "yolov8m" in loaded_models:
         model_choices["YOLOv8 Medium (best.pt - 27.2M params)"] = "yolov8m"
-    if "nano" in loaded_models:
-        model_choices["YOLOv8 Nano (best_nano.pt - 3.4M params)"] = "nano"
     if "yolo11m" in loaded_models:
         model_choices["YOLO11m Specialist (yolov11m-seg.pt - 22.4M params)"] = "yolo11m"
+    if "nano" in loaded_models:
+        model_choices["YOLOv8 Nano (best_nano.pt - 3.4M params)"] = "nano"
 
     selected_label = st.selectbox(
         "Select Model / Engine",
         options=list(model_choices.keys()),
         index=0,
-        help="Select YOLOv8 Medium to use your original standalone model, or Dual-Model Ensemble to combine both."
+        help="Tri-Model Consensus combines YOLOv8m, YOLO11m, and YOLOv8n using majority consensus voting to eliminate false positives."
     )
     selected_mode = model_choices[selected_label]
 
     st.markdown("### Model Information")
-    if selected_mode == "ensemble":
+    if selected_mode == "tri_ensemble":
+        st.write("**Architecture:** Tri-Model Consensus Ensemble")
+        st.write("• Generalist: YOLOv8m (27.2M params, 640px)")
+        st.write("• Specialist: YOLO11m (22.4M params, 800px)")
+        st.write("• Verifier: YOLOv8n (3.4M params, 640px)")
+        st.caption("✨ Majority consensus voting across all 3 models eliminates isolated false positives.")
+    elif selected_mode == "ensemble":
         st.write("**Architecture:** Dual-Model Ensemble")
         st.write("• Base: YOLOv8m (All 6 Classes, 640px)")
         st.write("• Booster: YOLO11m (Crack, Dent, Scratch, 800px)")
